@@ -3,7 +3,7 @@ Javascript Tetris using SAM pattern
 
 An HTML5 Tetris Game
 
- * [play the game](http://ashalkhakov.github.io/sam-tetris/)
+ * [play the game](https://ashalkhakov.github.io/sam-tetris/)
  * based on [source](https://github.com/jakesgordon/javascript-tetris)
    and the corresponding [blog article](http://codeincomplete.com/posts/2011/10/10/javascript_tetris/)
 
