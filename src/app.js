@@ -2,15 +2,31 @@
 // base helper methods
 //-------------------------------------------------------------------------
 
-if (!window.requestAnimationFrame) { // http://paulirish.com/2011/requestanimationframe-for-smart-animating/
-    window.requestAnimationFrame = window.webkitRequestAnimationFrame ||
-        window.mozRequestAnimationFrame    ||
-        window.oRequestAnimationFrame      ||
-        window.msRequestAnimationFrame     ||
-        function(callback, element) {
-            window.setTimeout(callback, 1000 / 60);
-        }
-}
+// requestAnimationFrame polyfill by Paul Irish et al
+(function() {
+    var lastTime = 0;
+    var vendors = ['ms', 'moz', 'webkit', 'o'];
+    for(var x = 0; x < vendors.length && !window.requestAnimationFrame; ++x) {
+        window.requestAnimationFrame = window[vendors[x]+'RequestAnimationFrame'];
+        window.cancelAnimationFrame = window[vendors[x]+'CancelAnimationFrame'] 
+                                   || window[vendors[x]+'CancelRequestAnimationFrame'];
+    }
+
+    if (!window.requestAnimationFrame)
+        window.requestAnimationFrame = function(callback, element) {
+            var currTime = new Date().getTime();
+            var timeToCall = Math.max(0, 16 - (currTime - lastTime));
+            var id = window.setTimeout(function() { callback(currTime + timeToCall); }, 
+              timeToCall);
+            lastTime = currTime + timeToCall;
+            return id;
+        };
+
+    if (!window.cancelAnimationFrame)
+        window.cancelAnimationFrame = function(id) {
+            clearTimeout(id);
+        };
+}());
 
 //-------------------------------------------------------------------------
 // game constants
@@ -91,6 +107,8 @@ var speed   = { start: 0.6, decrement: 0.005, min: 0.1 }, // how long before pie
 function getBlock(blocks, x,y) {
     return (blocks && blocks[x] ? blocks[x][y] : null);
 }
+
+var GSTATE = {INIT: 0, PLAYING: 1, PAUSED: 2, LOST: 3};
 
 var model = (function() {
     function reset() {
@@ -216,8 +234,10 @@ var model = (function() {
     return {
 	blocks: [],        // 2 dimensional array (nx*ny) representing tetris court - either empty block or occupied by a 'piece'
 	actions: [],       // queue of user actions (inputs)
-	playing: false,       // true|false - game is in progress
+	gstate: GSTATE.INIT, // game state
 	dt: 0,            // time since starting this game
+	last: null,       // time since last frame
+	ticking: false,      // flag to see if we are in the middle of a "tick"
 	current: null,       // the current piece
 	next: null,          // the next piece
 	score: 0,         // the current score
@@ -230,19 +250,20 @@ var model = (function() {
 	},
 
 	present: function(data) {
-	    if (model.playing) {
+	    if (model.gstate === GSTATE.PLAYING) {
 		if (data.dir !== undefined) {
 		    model.actions.push(data.dir);
 		}
+		if (data.start !== undefined) {
+		    model.gstate = GSTATE.PAUSED;
+		}
 		if (data.stop !== undefined) {
-		    reset();
-		    model.playing = false;
+		    model.gstate = GSTATE.LOST;
 		}
 		if (data.lose !== undefined) {
-		    reset();
-		    model.playing = false;
+		    model.gstate = GSTATE.LOST;
 		}
-		if (data.interval !== undefined) {
+		if (data.tick !== undefined) {
 		    if (model.vscore < model.score)
 			setVisualScore(model.vscore + 1);
 		    var action = model.actions.shift();
@@ -252,20 +273,34 @@ var model = (function() {
 		    case DIR.UP:    rotate();        break;
 		    case DIR.DOWN:  drop();          break;
 		    }
-		    model.dt = model.dt + data.interval;
+		    model.dt = model.dt + data.tick.v;
 		    if (model.dt > model.step) {
 			model.dt = model.dt - model.step;
 			drop();
 		    }
+		    model.last = data.tick.now;
 		}
+	    }
+	    else if (model.gstate === GSTATE.PAUSED) {
+		if (data.start !== undefined) {
+		    model.gstate = GSTATE.PLAYING;
+		}
+		if (data.tick !== undefined) {
+		    model.last = data.tick.now;
+		}	
 	    }
 	    else
 	    {
 		if (data.start !== undefined) {
 		    reset();
-		    model.playing = true;
+		    model.gstate = GSTATE.PLAYING;
+		}
+		if (data.tick !== undefined) {
+		    model.last = data.tick.now;
 		}
 	    }
+	    model.ticking = (data.tick !== undefined);
+	    state.render(model);
 	}
     }
 })();
@@ -279,67 +314,47 @@ var state = {
 	}
 	data.score = ("00000" + Math.floor(model.vscore)).slice(-5);
 	data.rows = model.rows;
-	data.playing = model.playing;
+
+	var hint = "";
+	switch (model.gstate) {
+	case GSTATE.INIT:
+	    hint = "Press SPACE to Play";
+	    break;
+	case GSTATE.PLAYING:
+	    hint = "Press SPACE to Pause, ESC to stop";
+	    break;
+	case GSTATE.PAUSED:
+	    hint = "Paused. Press SPACE to Resume";
+	    break;
+	case GSTATE.LOST:
+	    hint = "You Lost. Press SPACE to Restart";
+	    break;
+	}
+	data.hint = hint;
 
 	return data;
     },
     playing: function(model) {
-	return model.playing;
+	return model.gstate === GSTATE.PLAYING || model.gstate === GSTATE.PAUSED || model.gstate === GSTATE.LOST;
     },
     ready: function(model) {
 	return true;
     },
-    
+    nextAction: function(model) {
+	var last = model.last;
+	var ticking = model.ticking;
+
+	actions.tick({last: model.last, ticking: ticking});
+    },
+    render: function(model) {
+	var repr = state.representation(model);
+	if (model.ticking) {
+	    draw.draw(repr); // display via the view
+	}
+	state.nextAction(model);	
+    }
 };
 
-//-------------------------------------------------------------------------
-// GAME LOOP
-//-------------------------------------------------------------------------
-
-function run() {
-    function timestamp() {
-	return new Date().getTime();
-    }
-    addEvents(); // attach keydown and resize events
-    var last, now;
-    last = now = timestamp();
-    function frame() {
-        now = timestamp();
-	// using requestAnimationFrame have to be able to handle large delta's caused when it 'hibernates' in a background or non-visible tab
-	model.present({interval: Math.min(1, (now - last) / 1000.0)});
-	var repr = state.representation(model);
-        draw.draw(repr);
-        last = now;
-        requestAnimationFrame(frame, canvas);
-    }
-    draw.init(); // setup all our sizing information
-    model.init();
-    frame();  // start the first frame
-}
-function addEvents() {
-    document.addEventListener('keydown', keydown, false);
-}
-
-var KEY     = { ESC: 27, SPACE: 32, LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40 };
-
-function keydown(ev) {
-    var handled = false;
-
-    var data = {};
-    switch(ev.keyCode) {
-    case KEY.LEFT:   data.dir = DIR.LEFT;  handled = true; break;
-    case KEY.RIGHT:  data.dir = DIR.RIGHT; handled = true; break;
-    case KEY.UP:     data.dir = DIR.UP;    handled = true; break;
-    case KEY.DOWN:   data.dir = DIR.DOWN;  handled = true; break;
-    case KEY.ESC:    data.stop = true;     handled = true; break;
-    case KEY.SPACE:  data.start = true;    handled = true; break;
-    default: break;
-    }
-    model.present(data);
-
-    if (handled)
-        ev.preventDefault(); // prevent arrow keys from scrolling the page (supported in IE9+ and all other browsers)
-}
 //-------------------------------------------------------------------------
 // RENDERING
 //-------------------------------------------------------------------------
@@ -352,7 +367,7 @@ var draw = (function(canvas, ucanvas) {
     var uctx    = ucanvas.getContext('2d');
     var dx = 0, dy = 0; // pixel size of a single tetris block
 
-    var start = get('start');
+    var hint = get('hint');
     var rows = get('rows');
     var score = get('score');
 
@@ -380,10 +395,8 @@ var draw = (function(canvas, ucanvas) {
             score.innerHTML = data.score;
 	if (data.rows)
 	    rows.innerHTML = data.rows;
-	if (data.playing)
-	    hide(start);
-	else
-	    show(start);
+	if (data.hint)
+	    hint.innerHTML = data.hint;
 	ctx.restore();
     }
     function drawCourt(current, blocks) {
@@ -443,9 +456,76 @@ var draw = (function(canvas, ucanvas) {
     };
 })(get('canvas'), get('upcoming'));
 
+//-------------------------------------------------------------------------
+// ACTIONS
+//-------------------------------------------------------------------------
+
+var KEY     = { ESC: 27, SPACE: 32, LEFT: 37, UP: 38, RIGHT: 39, DOWN: 40 };
+
+var actions = (function() {
+    return {
+	keydown: function(ev, present) {
+	    var handled = false;
+	    present = present || model.present ;
+	    var data = {};
+
+	    switch(ev.keyCode) {
+	    case KEY.LEFT:   data.dir = DIR.LEFT;  handled = true; break;
+	    case KEY.RIGHT:  data.dir = DIR.RIGHT; handled = true; break;
+	    case KEY.UP:     data.dir = DIR.UP;    handled = true; break;
+	    case KEY.DOWN:   data.dir = DIR.DOWN;  handled = true; break;
+	    case KEY.ESC:    data.stop = true;     handled = true; break;
+	    case KEY.SPACE:  data.start = true;    handled = true; break;
+	    default: break;
+	    }
+
+	    model.present(data);
+
+	    if (handled)
+		ev.preventDefault(); // prevent arrow keys from scrolling the page (supported in IE9+ and all other browsers)
+	},
+
+	playPause: function(ev, present) {
+	    present = present || model.present;
+	    var data = {};
+	    data.start = true;
+	    model.present(data);
+	    ev.preventDefault();
+	},
+
+	tick: function(data, present) {
+	    present = present || model.present ;
+	    data = data || {};
+	    var d = data;
+	    var p = present;
+
+	    function timestamp() {
+		return new Date().getTime();
+	    }
+	    function frame() {
+		var last = d.last || timestamp();
+		var now = timestamp();
+		// FIXME; runs away, why?
+		var v = Math.min(1, (now - last) / 1000.0);
+
+		// using requestAnimationFrame have to be able to handle large delta's caused when it 'hibernates' in a background or non-visible tab
+		d.tick = {v: v, now: now};
+		p(d);
+	    }
+	    if (d.ticking) {
+		requestAnimationFrame(frame);
+	    }
+	}
+    };
+})();
 
 //-------------------------------------------------------------------------
 // FINALLY, lets run the game
 //-------------------------------------------------------------------------
+function run() {
+    document.onkeydown = actions.keydown;
+    draw.init(); // setup all our sizing information
+    model.init();
+    actions.tick({ticking: true});
+}
 run();
-
